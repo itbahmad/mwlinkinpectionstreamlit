@@ -1046,7 +1046,7 @@ if 'conflicts_data' not in st.session_state:
     st.session_state.conflicts_data = {}
 
 def main():
-    st.title("Smart Data Assistant with Mapping")
+    st.title("Smart Microwave Link Data Analyzer")
     
     # Initialize database connection and Gemini model
     conn, engine = connect_to_db()
