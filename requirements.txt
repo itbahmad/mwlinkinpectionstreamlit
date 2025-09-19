@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+leafmap
+folium
+pillow
+matplotlib
+openpyxl
+google-generativeai
+python-dotenv
+psycopg2-binary
+sqlalchemy
+python-dotenv
