@@ -11,6 +11,12 @@ from folium.plugins import MarkerCluster
 import leafmap.foliumap as leafmap
 import math
 import os
+from PIL import Image
+import zipfile
+import base64
+from datetime import datetime
+import openpyxl
+from openpyxl.drawing.image import Image as OpenpyxlImage
 
 # Set page config
 st.set_page_config(page_title="Data Assistant with Maps", layout="wide")
@@ -913,6 +919,222 @@ def create_relations(license_df, inspection_df):
     
     return updated_df, merged_df
 
+# ---------- EXCEL IMAGE PROCESSING FUNCTIONS ----------
+
+def extract_images_from_excel(uploaded_file):
+    """Extract images from an Excel file and return them as PIL Image objects"""
+    images = []
+    
+    try:
+        # Save uploaded file temporarily
+        with open("/tmp/temp_excel.xlsx", "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        # Load the workbook
+        workbook = openpyxl.load_workbook("/tmp/temp_excel.xlsx")
+        
+        for sheet_name in workbook.sheetnames:
+            worksheet = workbook[sheet_name]
+            
+            # Extract images from the worksheet
+            for image in worksheet._images:
+                try:
+                    # Get image data
+                    image_data = image._data()
+                    
+                    # Convert to PIL Image
+                    pil_image = Image.open(io.BytesIO(image_data))
+                    images.append({
+                        'image': pil_image,
+                        'sheet': sheet_name,
+                        'anchor': str(image.anchor._from if hasattr(image.anchor, '_from') else 'Unknown')
+                    })
+                except Exception as img_error:
+                    st.error(f"Error processing image in sheet {sheet_name}: {img_error}")
+                    continue
+        
+        workbook.close()
+        
+        # Clean up temp file
+        if os.path.exists("/tmp/temp_excel.xlsx"):
+            os.remove("/tmp/temp_excel.xlsx")
+            
+    except Exception as e:
+        st.error(f"Error extracting images from Excel: {e}")
+    
+    return images
+
+def analyze_idu_image_with_gemini(model, image):
+    """Analyze an IDU table image using Gemini API"""
+    
+    prompt = """Analyze the IDU table from this screenshot (ignore the ODU table if any) and extract ALL rows if multiple slots/columns exist in the table. For each row, provide the information in the format EXACTLY as shown below, repeating the block for every slot found:
+
+NE_NAME: [NE Name from the IDU Table]
+CHANNEL_SPACING: [Channel spacing, remove the MHz unit]
+TX_RF_FREQUENCY: [TX RF Frequency]
+RX_RF_FREQUENCY: [RX RF Frequency]
+DATE: [Date of screenshot if visible at the bottom right corner of the image, otherwise use today's date]
+
+If there are multiple rows, list them one after another. Do not summarize or skip any slot."""
+
+    try:
+        # Convert PIL image to bytes
+        img_buffer = io.BytesIO()
+        image.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        
+        # Analyze with Gemini
+        response = model.generate_content([prompt, image])
+        return response.text
+    except Exception as e:
+        st.error(f"Error analyzing image with Gemini: {e}")
+        return None
+
+def parse_gemini_idu_response(response_text):
+    """Parse Gemini response and extract structured IDU data"""
+    data_records = []
+    
+    if not response_text:
+        return data_records
+    
+    try:
+        # Split response into blocks based on NE_NAME occurrences
+        blocks = re.split(r'(?=NE_NAME:)', response_text)
+        
+        for block in blocks:
+            if not block.strip():
+                continue
+                
+            record = {}
+            
+            # Extract NE_NAME
+            ne_name_match = re.search(r'NE_NAME:\s*(.+?)(?:\n|$)', block, re.IGNORECASE)
+            if ne_name_match:
+                record['ne_name'] = ne_name_match.group(1).strip()
+            
+            # Extract CHANNEL_SPACING
+            spacing_match = re.search(r'CHANNEL_SPACING:\s*(.+?)(?:\n|$)', block, re.IGNORECASE)
+            if spacing_match:
+                spacing_value = spacing_match.group(1).strip()
+                # Remove 'MHz' unit if present
+                spacing_value = re.sub(r'\s*mhz\s*', '', spacing_value, flags=re.IGNORECASE)
+                record['channel_spacing'] = spacing_value
+            
+            # Extract TX_RF_FREQUENCY
+            tx_freq_match = re.search(r'TX_RF_FREQUENCY:\s*(.+?)(?:\n|$)', block, re.IGNORECASE)
+            if tx_freq_match:
+                record['tx_rf_frequency'] = tx_freq_match.group(1).strip()
+            
+            # Extract RX_RF_FREQUENCY
+            rx_freq_match = re.search(r'RX_RF_FREQUENCY:\s*(.+?)(?:\n|$)', block, re.IGNORECASE)
+            if rx_freq_match:
+                record['rx_rf_frequency'] = rx_freq_match.group(1).strip()
+            
+            # Extract DATE
+            date_match = re.search(r'DATE:\s*(.+?)(?:\n|$)', block, re.IGNORECASE)
+            if date_match:
+                date_value = date_match.group(1).strip()
+                # If "today's date" or similar, use current date
+                if 'today' in date_value.lower():
+                    record['date'] = datetime.now().strftime('%Y-%m-%d')
+                else:
+                    record['date'] = date_value
+            else:
+                # Default to current date if not found
+                record['date'] = datetime.now().strftime('%Y-%m-%d')
+            
+            # Only add record if it has at least NE_NAME or some frequency data
+            if record.get('ne_name') or record.get('tx_rf_frequency') or record.get('rx_rf_frequency'):
+                data_records.append(record)
+    
+    except Exception as e:
+        st.error(f"Error parsing Gemini response: {e}")
+    
+    return data_records
+
+def create_idu_dataframe(all_records):
+    """Create a pandas DataFrame from extracted IDU records"""
+    if not all_records:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(all_records)
+    
+    # Ensure all expected columns exist
+    expected_columns = ['ne_name', 'channel_spacing', 'tx_rf_frequency', 'rx_rf_frequency', 'date']
+    for col in expected_columns:
+        if col not in df.columns:
+            df[col] = ''
+    
+    # Reorder columns
+    df = df[expected_columns]
+    
+    return df
+
+def process_excel_images_workflow(uploaded_file, model, conn, engine):
+    """Complete workflow for processing Excel file with images"""
+    results = {
+        'success': False,
+        'message': '',
+        'dataframe': None,
+        'processed_count': 0
+    }
+    
+    try:
+        # Extract images from Excel
+        st.info("🔍 Extracting images from Excel file...")
+        images = extract_images_from_excel(uploaded_file)
+        
+        if not images:
+            results['message'] = "No images found in the Excel file."
+            return results
+        
+        st.success(f"📷 Found {len(images)} images in Excel file")
+        
+        all_records = []
+        processed_count = 0
+        
+        # Create progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, image_data in enumerate(images):
+            status_text.text(f"🤖 Processing image {i+1} of {len(images)} with Gemini AI...")
+            progress_bar.progress((i) / len(images))
+            
+            # Analyze image with Gemini
+            response_text = analyze_idu_image_with_gemini(model, image_data['image'])
+            
+            if response_text:
+                # Parse response and extract structured data
+                records = parse_gemini_idu_response(response_text)
+                all_records.extend(records)
+                processed_count += 1
+                
+                # Show preview of extracted data for this image
+                if records:
+                    st.write(f"📊 Extracted {len(records)} records from image in sheet '{image_data['sheet']}'")
+            
+            progress_bar.progress((i + 1) / len(images))
+        
+        status_text.text("✅ Image processing complete!")
+        
+        if all_records:
+            # Create DataFrame
+            df = create_idu_dataframe(all_records)
+            
+            results['success'] = True
+            results['dataframe'] = df
+            results['processed_count'] = processed_count
+            results['message'] = f"Successfully processed {processed_count} images and extracted {len(all_records)} IDU records"
+        else:
+            results['message'] = "No IDU data could be extracted from the images."
+    
+    except Exception as e:
+        results['message'] = f"Error processing Excel images: {str(e)}"
+        st.error(results['message'])
+    
+    return results
+
 # ---------- DATABASE FUNCTIONS ----------
 
 def connect_to_db():
@@ -1060,7 +1282,55 @@ def main():
         uploaded_file = st.file_uploader("Choose a file", type=["xlsx", "xls", "csv"])
         
         if uploaded_file is not None:
-            # Read file
+            # Check if this is an Excel file for potential image processing
+            is_excel = uploaded_file.name.endswith(('.xlsx', '.xls'))
+            
+            if is_excel:
+                # Add option for image processing
+                st.subheader("📋 Processing Options")
+                process_option = st.radio(
+                    "How would you like to process this Excel file?",
+                    ["📊 Process as data table", "📷 Extract and analyze images with AI"],
+                    help="Choose 'Extract and analyze images' if your Excel contains IDU table screenshots"
+                )
+                
+                if process_option == "📷 Extract and analyze images with AI":
+                    st.info("🤖 This will extract images from Excel and analyze IDU tables using Gemini AI")
+                    
+                    if st.button("🚀 Process Images with AI", type="primary"):
+                        if model:
+                            # Process Excel images workflow
+                            results = process_excel_images_workflow(uploaded_file, model, conn, engine)
+                            
+                            if results['success']:
+                                st.success(results['message'])
+                                
+                                # Display extracted data
+                                st.subheader("📊 Extracted IDU Data")
+                                st.dataframe(results['dataframe'])
+                                
+                                # Ask for table name to save
+                                table_name = st.text_input("Enter table name for IDU data:", value="idu_extracted_data")
+                                
+                                if table_name and st.button("💾 Save IDU Data to Database"):
+                                    if conn and engine:
+                                        if save_dataframe_to_postgres(results['dataframe'], table_name, engine):
+                                            st.success(f"✅ IDU data saved to table '{table_name}' successfully!")
+                                            # Store in session state
+                                            st.session_state.dataframes[table_name] = results['dataframe']
+                                        else:
+                                            st.error("❌ Failed to save IDU data to database.")
+                                    else:
+                                        st.warning("⚠️ Database connection not available. Storing in session only.")
+                                        st.session_state.dataframes[table_name] = results['dataframe']
+                                        st.success(f"✅ IDU data saved to session as '{table_name}'")
+                            else:
+                                st.error(results['message'])
+                        else:
+                            st.error("❌ Gemini AI not available. Please check API configuration.")
+                    return  # Exit early to avoid showing regular file processing
+            
+            # Regular file processing (for CSV or Excel as data)
             try:
                 if uploaded_file.name.endswith('.csv'):
                     df = pd.read_csv(uploaded_file)
