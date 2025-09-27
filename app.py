@@ -15,6 +15,108 @@ import os
 # Set page config
 st.set_page_config(page_title="Data Assistant with Maps", layout="wide")
 
+# ---------- DATA VALIDATION FUNCTIONS ----------
+
+def validate_coordinate_data(df):
+    """
+    Validate that the dataframe contains coordinate columns and valid coordinate data
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The dataframe to validate
+        
+    Returns:
+    --------
+    dict : Validation results containing coordinate column info and validity counts
+    """
+    results = {
+        'has_coordinates': False,
+        'lat_col': None,
+        'lon_col': None,
+        'valid_count': 0,
+        'invalid_count': 0,
+        'coordinate_range': None
+    }
+    
+    # Handle case-insensitive column names
+    column_mapping = {col.lower(): col for col in df.columns}
+    
+    # Get lat/long columns using case-insensitive lookup
+    lat_col = next((column_mapping[name] for name in ['sid_lat', 'latitude'] 
+                  if name in column_mapping), None)
+    lon_col = next((column_mapping[name] for name in ['sid_long', 'longitude'] 
+                  if name in column_mapping), None)
+    
+    if lat_col and lon_col:
+        results['has_coordinates'] = True
+        results['lat_col'] = lat_col
+        results['lon_col'] = lon_col
+        
+        # Validate coordinate data
+        valid_coords = []
+        for idx, row in df.iterrows():
+            try:
+                lat = float(row[lat_col])
+                lon = float(row[lon_col])
+                
+                # Check if coordinates are reasonable (basic validation)
+                if (-90 <= lat <= 90) and (-180 <= lon <= 180) and not (np.isnan(lat) or np.isnan(lon)):
+                    results['valid_count'] += 1
+                    valid_coords.append((lat, lon))
+                else:
+                    results['invalid_count'] += 1
+            except (ValueError, TypeError):
+                results['invalid_count'] += 1
+        
+        # Calculate coordinate range if we have valid coordinates
+        if valid_coords:
+            lats, lons = zip(*valid_coords)
+            results['coordinate_range'] = {
+                'lat_min': min(lats),
+                'lat_max': max(lats),
+                'lon_min': min(lons),
+                'lon_max': max(lons)
+            }
+    
+    return results
+
+def create_auto_map_for_uploaded_data(df, table_name, validation_results):
+    """
+    Automatically create and display a map for uploaded coordinate data
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        The uploaded dataframe
+    table_name : str
+        Name of the table/dataset
+    validation_results : dict
+        Results from coordinate validation
+    """
+    try:
+        if not validation_results['has_coordinates'] or validation_results['valid_count'] == 0:
+            return
+        
+        # Create a map using the existing create_combined_map function
+        dataframes_dict = {table_name: df}
+        map_obj = create_combined_map(dataframes_dict, return_map=True)
+        
+        if isinstance(map_obj, str):
+            st.error(f"Error creating map: {map_obj}")
+        else:
+            st.subheader("📍 Map Visualization")
+            st.info(f"Displaying {validation_results['valid_count']} coordinate points from uploaded data")
+            
+            # Display the map
+            try:
+                map_obj.to_streamlit(height=500)
+            except Exception as e:
+                st.error(f"Error displaying map: {e}")
+                
+    except Exception as e:
+        st.error(f"Error in auto-map generation: {e}")
+
 # ---------- HELPER FUNCTIONS FROM MICROWAVE INSPECTION ----------
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -1070,23 +1172,60 @@ def main():
                 st.write("File preview:")
                 st.dataframe(df.head())
                 
+                # Enhanced data validation for coordinates
+                validation_results = validate_coordinate_data(df)
+                
+                if validation_results['has_coordinates']:
+                    st.success(f"✅ Coordinate columns detected: {validation_results['lat_col']} and {validation_results['lon_col']}")
+                    
+                    if validation_results['valid_count'] > 0:
+                        st.info(f"📍 Found {validation_results['valid_count']} valid coordinate pairs out of {len(df)} rows")
+                        
+                        # Show coordinate range
+                        if validation_results['coordinate_range']:
+                            range_info = validation_results['coordinate_range']
+                            st.write(f"**Coordinate Range:**")
+                            st.write(f"- Latitude: {range_info['lat_min']:.6f} to {range_info['lat_max']:.6f}")
+                            st.write(f"- Longitude: {range_info['lon_min']:.6f} to {range_info['lon_max']:.6f}")
+                    
+                    if validation_results['invalid_count'] > 0:
+                        st.warning(f"⚠️ {validation_results['invalid_count']} rows have invalid or missing coordinates")
+                        
+                else:
+                    st.warning("⚠️ No coordinate columns found (SID_LAT, SID_LONG, latitude, longitude)")
+                    st.info("The data can still be uploaded, but map visualization won't be available.")
+                
                 # Ask for table name
                 table_name = st.text_input("Enter table name for this data:")
                 
                 if table_name and st.button("Save to Database"):
-                    if conn and engine:
-                        if save_dataframe_to_postgres(df, table_name, engine):
-                            st.success(f"Data saved to table '{table_name}' successfully!")
-                            # Also store in session state
-                            st.session_state.dataframes[table_name] = df
+                    with st.spinner("Saving data to database..."):
+                        if conn and engine:
+                            if save_dataframe_to_postgres(df, table_name, engine):
+                                st.success(f"✅ Data saved to table '{table_name}' successfully!")
+                                # Also store in session state
+                                st.session_state.dataframes[table_name] = df
+                                
+                                # Auto-generate map if coordinates exist
+                                if validation_results['has_coordinates'] and validation_results['valid_count'] > 0:
+                                    st.success("🗺️ Generating map visualization...")
+                                    create_auto_map_for_uploaded_data(df, table_name, validation_results)
+                                    
+                            else:
+                                st.error("❌ Failed to save data to database.")
                         else:
-                            st.error("Failed to save data to database.")
-                    else:
-                        st.warning("Database connection not available. Storing in session only.")
-                        st.session_state.dataframes[table_name] = df
-                        st.success(f"Data saved to session as '{table_name}'")
+                            st.warning("⚠️ Database connection not available. Storing in session only.")
+                            st.session_state.dataframes[table_name] = df
+                            st.success(f"✅ Data saved to session as '{table_name}'")
+                            
+                            # Auto-generate map if coordinates exist
+                            if validation_results['has_coordinates'] and validation_results['valid_count'] > 0:
+                                st.success("🗺️ Generating map visualization...")
+                                create_auto_map_for_uploaded_data(df, table_name, validation_results)
+                                
             except Exception as e:
-                st.error(f"Error reading file: {e}")
+                st.error(f"❌ Error reading file: {e}")
+                st.info("Please ensure the file is a valid Excel (.xlsx, .xls) or CSV file.")
         
         # Display database tables
         st.header("Database Tables")
